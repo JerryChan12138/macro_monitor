@@ -1,0 +1,87 @@
+import os
+import pandas as pd
+import requests
+import yfinance as yf
+
+# 定义核心标的映射
+TICKERS = {"Nasdaq": "QQQ", "Brent": "BZ=F", "VIX": "^VIX", "US10Y": "^TNX"}
+
+
+def send_wechat_notification(webhook_url, message):
+  """发送消息到企业微信群机器人"""
+  headers = {"Content-Type": "application/json"}
+  data = {"msgtype": "text", "text": {"content": message}}
+  response = requests.post(webhook_url, json=data, headers=headers)
+  if response.status_code == 200:
+    print("企业微信消息推送成功！")
+  else:
+    print(f"推送失败，返回码: {response.status_code}, 原因: {response.text}")
+
+
+def run_macro_monitor():
+  print("开始拉取宏观资产实时行情...")
+  data = pd.DataFrame()
+  for name, ticker in TICKERS.items():
+    df = yf.download(ticker, period="6mo", interval="1d", progress=False)
+    if isinstance(df.columns, pd.MultiIndex):
+      data[name] = df["Close"].iloc[:, 0]
+    else:
+      data[name] = df["Close"]
+  df_raw = data.dropna()
+
+  # 计算 60 日滚动 Z-Score（偏离度）
+  window = 60
+  z_scores = pd.DataFrame()
+  for col in df_raw.columns:
+    rolling_mean = df_raw[col].rolling(window).mean()
+    rolling_std = df_raw[col].rolling(window).std()
+    z_scores[col] = (df_raw[col] - rolling_mean) / rolling_std
+
+  # 合成综合宏观风险得分
+  z_scores["Macro_Risk_Index"] = (
+      0.35 * z_scores["US10Y"]
+      + 0.25 * z_scores["Brent"]
+      + 0.40 * z_scores["VIX"]
+  )
+
+  latest = z_scores.iloc[-1]
+  raw_latest = df_raw.iloc[-1]
+  risk_score = latest["Macro_Risk_Index"]
+
+  # 组装推送文案
+  msg = (
+      f"📊 【宏观风控雷达日报】\n"
+      f"----------------------------------\n"
+      f"• 纳指 QQQ: {raw_latest['Nasdaq']:.2f}\n"
+      f"• 布伦特原油: {raw_latest['Brent']:.2f}\n"
+      f"• VIX 恐慌指数: {raw_latest['VIX']:.2f}\n"
+      f"• 10年期美债(TNX): {raw_latest['US10Y']:.2f}%\n"
+      f"----------------------------------\n"
+      f"🎯 综合宏观风险得分: {risk_score:.2f}\n"
+  )
+
+  if risk_score > 1.5:
+    msg += (
+        "🚨 【高级预警】：流动性或通胀压力极大，风险得分突破 +1.5，"
+        "建议收缩高估值成长股仓位！"
+    )
+  elif risk_score < -1.5:
+    msg += (
+        "💡 【左侧机会】：风险得分低于 -1.5，市场情绪冰点或流动性转向，"
+        "关注超跌反弹！"
+    )
+  else:
+    msg += "✅ 【状态平稳】：宏观指标在正常波动区间，维持既定策略。"
+
+  print(msg)
+
+  # 从环境变量读取企业微信 Webhook 并发送
+  wechat_url = os.getenv("WECHAT_WEBHOOK_URL")
+  if wechat_url:
+    send_wechat_notification(wechat_url, msg)
+  else:
+    print("未检测到 WECHAT_WEBHOOK_URL 环境变量，跳过推送。")
+
+
+if __name__ == "__main__":
+  run_macro_monitor()
